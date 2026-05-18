@@ -347,7 +347,7 @@ input[type=checkbox]{accent-color:var(--black);cursor:pointer}
 <body>
 <div id="root"></div>
 <script type="text/babel" data-presets="react">
-const API_URL = "https://voxatest.onrender.com/api";
+const API_URL = "https://voxatest.onrender.com";
 
 const { useState, useEffect, useMemo, useRef, useCallback } = React;
 const R = (typeof Recharts !== "undefined") ? Recharts : {};
@@ -3957,7 +3957,11 @@ function ManualTrackerView({ user }) {
   async function flushEmpty(id) {
     if (flushingRef.current.has(id)) return; // prevent re-entrancy / race
     const row = empties.find(r=>r._id===id);
-    if (!row||!row.name.trim()||!row.phone.trim()) return;
+    // Only save when the row is meaningfully complete:
+    // name + phone (required) + callStatus (signals the row is done)
+    if (!row) return;
+    if (!row.name.trim() || !row.phone.trim()) return;
+    if (!row.callStatus || !String(row.callStatus).trim()) return;
     flushingRef.current.add(id);
     _setSS(id,"saving");
     try {
@@ -4207,6 +4211,7 @@ function ManualTrackerView({ user }) {
                     {ss==="saving" && <Spin/>}
                     {ss==="ok"     && <span style={{color:"var(--green)",fontSize:14,lineHeight:1}}>✓</span>}
                     {!ss&&isDirty  && <span style={{color:"#f59e0b",fontSize:16,lineHeight:1}}>●</span>}
+                    {!ss&&!isSaved&&(row.name||row.phone)&&!(row.callStatus&&row.callStatus.trim()) && <span title="Fill Call Status to save" style={{color:"#94a3b8",fontSize:11,cursor:"default"}}>⏸</span>}
                   </td>
                 </tr>
               );
@@ -4226,7 +4231,7 @@ function ManualTrackerView({ user }) {
         <div style={{padding:"5px 12px",fontSize:10,fontFamily:"var(--fm)",color:"var(--muted)",background:"#fafafa",borderTop:"1px solid #eee",display:"flex",gap:16,flexWrap:"wrap"}}>
           <span>Tab — next cell</span>
           <span>Enter — next row</span>
-          <span>Saves on blur, Tab, or Enter</span>
+          <span>New rows save when Call Status is set · Existing rows save on blur</span>
           {Object.values(saveState).some(s=>s==="saving") && <span style={{color:"var(--blue)"}}>Saving…</span>}
         </div>
       </div>

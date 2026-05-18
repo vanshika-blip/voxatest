@@ -43,8 +43,10 @@ const PORT = process.env.PORT || 10000;
 // ─── Env vars ──────────────────────────────────────────────────────────────────
 const MAIN_SS_ID      = process.env.SPREADSHEET_ID;
 const HUNAR_BASE      = 'https://api.voice.hunar.ai';
-const HUNAR_KEY       = process.env.HUNAR_API_KEY;
+const HUNAR_KEY       = process.env.HUNAR_API_KEY || 'hunar_va_live_sk_qH3Xewk3DcBI68rKsMtLmBxw60earGaMWQdcZIEW_mcmIdwn_x8FRQ';
 const POLLER_TOKEN    = process.env.POLLER_TOKEN || 'voxa-bfsi-2026';
+const MANUAL_TRACKER_SS_ID = process.env.MANUAL_TRACKER_SS_ID || '';
+const LINEUP_SS_ID         = process.env.LINEUP_SS_ID || '';
 const SERVICE_EMAIL   = process.env.SERVICE_ACCOUNT_EMAIL || '';
 const GAS_URL         = process.env.GAS_URL; // Only used for email sending (optional)
 const PORTAL_MAIL     = process.env.MAIL_FROM || 'Voxa <noreply@voxa.ai>';
@@ -333,10 +335,21 @@ function _getGoogleAuth() {
 }
 
 async function createSpreadsheet(title) {
-  const auth = _getGoogleAuth();
-  const sheets = google.sheets({ version: 'v4', auth });
-  const res = await sheets.spreadsheets.create({ requestBody: { properties: { title } } });
-  return res.data.spreadsheetId;
+  try {
+    // Use only Sheets API scope (no Drive needed) to create the spreadsheet
+    const b64 = process.env.GOOGLE_SERVICE_ACCOUNT_B64;
+    if (!b64) throw new Error('GOOGLE_SERVICE_ACCOUNT_B64 not set');
+    const sa = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+    const sheetsOnlyAuth = new google.auth.GoogleAuth({
+      credentials: sa,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    const client = google.sheets({ version: 'v4', auth: sheetsOnlyAuth });
+    const res = await client.spreadsheets.create({ requestBody: { properties: { title } } });
+    return res.data.spreadsheetId;
+  } catch (e) {
+    throw new Error('Could not create spreadsheet: ' + e.message);
+  }
 }
 
 async function shareSpreadsheet(fileId, ...emails) {
@@ -841,8 +854,14 @@ async function handleAddAgentById(actor, body) {
   let agentCode  = `${baseCode}_${suffix}`;
   let n = 1;
   while (agents.find(a => a.agentCode === agentCode)) agentCode = `${baseCode}_${suffix}_${++n}`;
-  const ssId = await createSpreadsheet(`Voxa Agent: ${agentCode}`);
-  if (SERVICE_EMAIL) await shareSpreadsheet(ssId, SERVICE_EMAIL, actor.email);
+  let ssId;
+  try {
+    ssId = await createSpreadsheet(`Voxa Agent: ${agentCode}`);
+  } catch (e) {
+    return { ok: false, error: 'SPREADSHEET_CREATE_FAILED', message: e.message + ' — Check that GOOGLE_SERVICE_ACCOUNT_B64 env var is set on Render.' };
+  }
+  // Share is non-fatal — fails silently if Drive API not enabled
+  shareSpreadsheet(ssId, SERVICE_EMAIL, actor.email).catch(() => {});
   const agentObj = {
     agentCode, agentId: d.id, displayName: d.name, description: d.summary || '',
     language: d.language || 'ENGLISH', voicePersona: d.voice_persona || '',
@@ -1384,15 +1403,111 @@ async function handleGetDashboard(actor, body) {
     } catch (_) {}
   }
 
+  // ── Manual Tracker stats (from central SS) ───────────────────────────────
+  let manualTotal = 0, manualConnected = 0, manualLinedUp = 0;
+  const manualByTeam = {};
+
+  if (MANUAL_TRACKER_SS_ID) {
+    try {
+      const users = await getAllUsers();
+      const visTeams = actor.role === 'super_admin'
+        ? (await getAllTeams()).map(t => t.name)
+        : [actor.team].filter(Boolean);
+
+      for (const teamName of visTeams) {
+        try {
+          const { headers, rows } = await readSheet(MANUAL_TRACKER_SS_ID, teamName);
+          if (!headers.length) continue;
+          const csi = headers.indexOf('Call Status');
+          const lui = headers.indexOf('Lined-up');
+          const dti = headers.indexOf('Date');
+          const aei = headers.indexOf('Added By Email');
+
+          let tTotal = 0, tConn = 0, tLined = 0;
+          rows.forEach(r => {
+            // date filter
+            if (dti >= 0 && r[dti]) {
+              const d = new Date(r[dti]);
+              if (!isNaN(d.getTime()) && d < sinceDate) return;
+            }
+            // role filter — recruiter sees only their own
+            if ((actor.role === 'recruiter' || actor.role === 'individual_contributor') && aei >= 0) {
+              if (String(r[aei] || '').toLowerCase() !== actor.email) return;
+            }
+            tTotal++;
+            if (csi >= 0 && String(r[csi] || '').toLowerCase().includes('connected')) tConn++;
+            if (lui >= 0 && String(r[lui] || '').toLowerCase() === 'yes') tLined++;
+          });
+
+          manualTotal    += tTotal;
+          manualConnected += tConn;
+          manualLinedUp   += tLined;
+          manualByTeam[teamName] = { total: tTotal, connected: tConn, linedUp: tLined };
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
+  // ── Lineup stats (from central SS) ────────────────────────────────────────
+  let lineupTotal = 0, lineupByTeam = {};
+
+  if (LINEUP_SS_ID) {
+    try {
+      const visTeams = actor.role === 'super_admin'
+        ? (await getAllTeams()).map(t => t.name)
+        : [actor.team].filter(Boolean);
+
+      for (const teamName of visTeams) {
+        try {
+          const { headers, rows } = await readSheet(LINEUP_SS_ID, teamName);
+          if (!headers.length) continue;
+          const aei = headers.indexOf('Assigned Recruiter Email');
+          const dti = headers.indexOf('Date Added');
+          let count = 0;
+          rows.forEach(r => {
+            if (dti >= 0 && r[dti]) {
+              const d = new Date(r[dti]);
+              if (!isNaN(d.getTime()) && d < sinceDate) return;
+            }
+            if ((actor.role === 'recruiter' || actor.role === 'individual_contributor') && aei >= 0) {
+              if (String(r[aei] || '').toLowerCase() !== actor.email) return;
+            }
+            count++;
+          });
+          lineupTotal += count;
+          lineupByTeam[teamName] = count;
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
   const timeSeries = Object.keys(byDay).sort().map(d => ({
     day: d, calls: byDay[d].calls, minutes: Math.round(byDay[d].minutes * 100) / 100, qualified: byDay[d].qualified || 0,
   }));
   return {
     ok: true, range,
     stats: {
+      // AI call stats
       totalCalls, totalMinutes: Math.round(totalMins * 100) / 100,
       qualifiedLeads: qualCount, lineupCount,
       conversionRate: qualCount > 0 ? Math.round(lineupCount / qualCount * 1000) / 10 : 0,
+      // Manual tracker stats
+      manual: {
+        total: manualTotal,
+        connected: manualConnected,
+        linedUp: manualLinedUp,
+        byTeam: manualByTeam,
+      },
+      // Interview lineup stats
+      lineup: {
+        total: lineupTotal,
+        byTeam: lineupByTeam,
+      },
+      // Combined
+      combined: {
+        totalLeads:   qualCount + manualTotal,
+        totalLinedUp: lineupCount + manualLinedUp,
+      },
     },
     timeSeries,
   };
