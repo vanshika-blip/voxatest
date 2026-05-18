@@ -335,20 +335,21 @@ function _getGoogleAuth() {
 }
 
 async function createSpreadsheet(title) {
+  // GAS has full Drive access — delegate spreadsheet creation to GAS
+  // Node cannot create Drive files due to org policy restrictions on service accounts
+  const gasUrl = process.env.GAS_URL;
+  if (!gasUrl) throw new Error('GAS_URL not set — needed for spreadsheet creation');
   try {
-    // Use only Sheets API scope (no Drive needed) to create the spreadsheet
-    const b64 = process.env.GOOGLE_SERVICE_ACCOUNT_B64;
-    if (!b64) throw new Error('GOOGLE_SERVICE_ACCOUNT_B64 not set');
-    const sa = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
-    const sheetsOnlyAuth = new google.auth.GoogleAuth({
-      credentials: sa,
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-    });
-    const client = google.sheets({ version: 'v4', auth: sheetsOnlyAuth });
-    const res = await client.spreadsheets.create({ requestBody: { properties: { title } } });
-    return res.data.spreadsheetId;
+    const res = await axios.post(gasUrl, {
+      action: 'createspreadsheet',
+      title,
+      secret: process.env.POLLER_TOKEN || 'voxa-bfsi-2026',
+    }, { timeout: 30000 });
+    const data = res.data;
+    if (!data.ok || !data.ssId) throw new Error(data.error || 'GAS did not return ssId');
+    return data.ssId;
   } catch (e) {
-    throw new Error('Could not create spreadsheet: ' + e.message);
+    throw new Error('Could not create spreadsheet via GAS: ' + e.message);
   }
 }
 
