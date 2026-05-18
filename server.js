@@ -2,8 +2,13 @@
 /**
  * server.js
  *
- * POST /                    → proxy to GAS (all user-facing actions)
- * POST /api/forcepoll       → session-auth force poll (super_admin only, runs on Node)
+ * Auth (login/logout/session) → handled by Node (auth.js) — NO GAS involved
+ * Everything else             → proxy to GAS
+ *
+ * POST /                    → proxy to GAS (all non-auth actions)
+ * POST /api/login           → Node auth (login)
+ * POST /api/logout          → Node auth (logout)
+ * POST /api/forcepoll       → session-auth force poll (super_admin only)
  * GET  /api/pollstatus      → session-auth poll status
  * GET  /poller/status       → Bearer token poll health
  * POST /poller/force-refresh→ Bearer token force poll
@@ -20,18 +25,23 @@ const axios   = require('axios');
 const path    = require('path');
 
 const {
-  startPoller, getStatus, validateSession,
+  startPoller, getStatus,
   allTeams, getArchiveLeads, getArchiveMT, getArchiveManual,
   pollActiveBatches, backfillMissingOutputs, repairUnassignedLeads,
-  cleanupExpiredSessions, dedupeAllSheets,
+  cleanupExpiredSessions: pollerCleanupSessions, dedupeAllSheets,
   archiveCompletedLeads, archiveCompletedMT, archiveManualTracker,
   processCallbackQueue, processRetryQueue,
 } = require('./poller');
 
-const app    = express();
-const PORT   = process.env.PORT || 10000;
-const GAS    = process.env.GAS_URL;
-const TOKEN  = process.env.POLLER_TOKEN || 'voxa-bfsi-2026';
+const {
+  login, validateSession, logout,
+  cleanupExpiredSessions: authCleanupSessions,
+} = require('./auth');
+
+const app   = express();
+const PORT  = process.env.PORT || 10000;
+const GAS   = process.env.GAS_URL;
+const TOKEN = process.env.POLLER_TOKEN || 'voxa-bfsi-2026';
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -57,13 +67,74 @@ function resolveTeam(user, requested) {
   return user.team || null;
 }
 
-// ─── Proxy → GAS ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTH ROUTES — handled entirely by Node, never touch GAS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Login
+app.post('/api/login', async (req, res) => {
+  const { email, password } = req.body || {};
+  try {
+    const result = await login(email, password);
+    res.json(result);
+  } catch (e) {
+    console.error('[login]', e.message);
+    res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// Logout
+app.post('/api/logout', async (req, res) => {
+  const token = req.body?.session || req.headers['x-session'];
+  if (token) logout(token);
+  res.json({ ok: true });
+});
+
+// Me — returns current user info from session
+app.post('/api/me', async (req, res) => {
+  const user = await sessionAuth(req, res);
+  if (!user) return;
+  res.json({ ok: true, user });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PROXY → GAS (all non-auth actions)
+// Login/logout/me are intercepted above and never reach here
+// ─────────────────────────────────────────────────────────────────────────────
 app.post('/', async (req, res) => {
   if (!GAS) return res.json({ ok: false, error: 'GAS_URL not configured' });
+
+  const action = String(req.body?.action || '').toLowerCase();
+
+  // Intercept login/logout at the root too (for frontend compatibility)
+  if (action === 'login') {
+    const { email, password } = req.body || {};
+    try {
+      const result = await login(email, password);
+      return res.json(result);
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+    }
+  }
+
+  if (action === 'logout') {
+    const token = req.body?.session || req.headers['x-session'];
+    if (token) logout(token);
+    return res.json({ ok: true });
+  }
+
+  // For all other actions, validate session via Node before proxying
+  // This way even if GAS is down, we don't let unauthenticated requests through
+  if (action !== 'ping' && action !== 'verifytoken' && action !== 'completesetup' && action !== 'requestreset') {
+    const token = req.body?.session || req.headers['x-session'];
+    const sess  = await validateSession(token);
+    if (!sess) return res.json({ ok: false, error: 'UNAUTHENTICATED' });
+  }
+
   try {
     const r = await axios.post(GAS, req.body, {
       headers: { 'Content-Type': 'application/json' },
-      timeout: 55000,  // GAS can be slow, give it time
+      timeout: 55000,
     });
     res.json(r.data);
   } catch (e) {
@@ -74,7 +145,6 @@ app.post('/', async (req, res) => {
 });
 
 // ─── Force poll — session auth, callable from frontend ───────────────────────
-// Super admin presses "Force Poll" in UI → hits this → Node starts poll immediately
 app.post('/api/forcepoll', async (req, res) => {
   const user = await sessionAuth(req, res); if (!user) return;
   if (user.role !== 'super_admin') return res.status(403).json({ ok: false, error: 'FORBIDDEN' });
@@ -83,12 +153,11 @@ app.post('/api/forcepoll', async (req, res) => {
   if (status.pollRunning) {
     return res.json({ ok: false, error: 'POLL_ALREADY_RUNNING', message: 'A poll is already running. Check back in a minute.' });
   }
-  // Fire and don't await — respond immediately so frontend doesn't hang
   pollActiveBatches(agentCode || null).catch(e => console.error('[forcepoll]', e.message));
   res.json({ ok: true, message: agentCode ? `Poll started for ${agentCode}` : 'Poll started for all agents', note: 'Runs in background. Refresh leads in ~30 seconds.' });
 });
 
-// ─── Poll status — session auth, callable from frontend ──────────────────────
+// ─── Poll status ──────────────────────────────────────────────────────────────
 app.get('/api/pollstatus', async (req, res) => {
   const token = req.headers['x-session'] || req.query.session;
   const user  = await validateSession(token);
@@ -97,7 +166,7 @@ app.get('/api/pollstatus', async (req, res) => {
   res.json({ ok: true, ...getStatus() });
 });
 
-// ─── Poller admin (Bearer token — for Render dashboard / curl) ───────────────
+// ─── Poller admin (Bearer token) ─────────────────────────────────────────────
 app.get('/poller/status', auth, (req, res) => res.json({ ok: true, ...getStatus() }));
 
 app.post('/poller/force-refresh', auth, async (req, res) => {
@@ -112,7 +181,7 @@ const JOBS = {
   poll:       () => pollActiveBatches(),
   backfill:   () => backfillMissingOutputs(),
   repair:     () => repairUnassignedLeads(),
-  sessions:   () => cleanupExpiredSessions(),
+  sessions:   () => authCleanupSessions(),
   dedupe:     () => dedupeAllSheets(),
   archLeads:  () => archiveCompletedLeads(),
   archMT:     () => archiveCompletedMT(),
