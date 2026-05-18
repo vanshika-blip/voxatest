@@ -38,12 +38,12 @@ const PORTAL = {
   AUDIT:        'Audit Log',
 };
 const AGT = {
-  CALL_INPUT:       '_Call_Input',
-  CAMPAIGN_TRACKER: '_Campaign_Tracker',
-  MASTER_TRACKER:   '_Master_Tracker',
-  QUALIFIED_LEADS:  '_Qualified_Leads',
-  NOT_CONNECTED:    '_Not_Connected',
-  CALLBACKS:        '_Callbacks',
+  CALL_INPUT:       'Call_Input',
+  CAMPAIGN_TRACKER: 'Campaign_Tracker',
+  MASTER_TRACKER:   'Master_Tracker',
+  QUALIFIED_LEADS:  'Qualified_Leads',
+  NOT_CONNECTED:    'Not_Connected',
+  CALLBACKS:        'Callbacks',
 };
 const QUEUE = {
   CALLBACK:         '_Callback_Queue',
@@ -147,6 +147,7 @@ async function getAllAgents(force = false) {
       active:             r[idx('Active')] === true || r[idx('Active')] === 'TRUE',
       createdBy:          String(r[idx('Created By')] || '').trim(),
       clientName:         String(r[idx('Client Name')] || '').trim(),
+      spreadsheetId:      String(r[idx('Spreadsheet ID')] || '').trim(),
     };
   }).filter(a => a.agentCode);
 
@@ -319,11 +320,13 @@ async function pollActiveBatches(agentCodeFilter = null) {
 
 async function _pollAgent(agent, userRoleMap, triggerMap) {
   const stats = { fetched: 0, updated: 0, errors: 0, qlAdded: 0 };
-  const mtName = agent.agentCode + AGT.MASTER_TRACKER;
-  const qlName = agent.agentCode + AGT.QUALIFIED_LEADS;
-  const ncName = agent.agentCode + AGT.NOT_CONNECTED;
+  // Use per-agent spreadsheet (agent.spreadsheetId). Fall back to MAIN_SS_ID with prefix for legacy.
+  const agentSsId = agent.spreadsheetId || MAIN_SS_ID;
+  const mtName = agent.spreadsheetId ? AGT.MASTER_TRACKER : (agent.agentCode + AGT.MASTER_TRACKER);
+  const qlName = agent.spreadsheetId ? AGT.QUALIFIED_LEADS : (agent.agentCode + AGT.QUALIFIED_LEADS);
+  const ncName = agent.spreadsheetId ? AGT.NOT_CONNECTED   : (agent.agentCode + AGT.NOT_CONNECTED);
 
-  const { headers: mtHeaders, rows: mtRows } = await readSheet(MAIN_SS_ID, mtName);
+  const { headers: mtHeaders, rows: mtRows } = await readSheet(agentSsId, mtName);
   if (!mtHeaders.length || !mtRows.length) return stats;
 
   const callIdCol = mtHeaders.indexOf('Call ID');
@@ -335,17 +338,18 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
   const customVars   = agent.customVariables || [];
 
   // Load QL existing IDs
-  const { headers: qlHeaders, rows: qlRows } = await readSheet(MAIN_SS_ID, qlName);
+  const { headers: qlHeaders, rows: qlRows } = await readSheet(agentSsId, qlName);
   const qlIdCol = qlHeaders.indexOf('Call ID');
   const qlExistingIds = new Set();
   if (qlIdCol >= 0) qlRows.forEach(r => { if (r[qlIdCol]) qlExistingIds.add(String(r[qlIdCol]).trim()); });
 
   // Load NC existing IDs
-  const { rows: ncRows } = await readSheet(MAIN_SS_ID, ncName);
+  const { rows: ncRows } = await readSheet(agentSsId, ncName);
   const ncExistingIds = new Set(ncRows.map(r => String(r[0] || '').trim()).filter(Boolean));
 
   // Load campaign statuses
-  const { headers: ctHeaders, rows: ctRows } = await readSheet(MAIN_SS_ID, agent.agentCode + AGT.CAMPAIGN_TRACKER);
+  const ctSheetName = agent.spreadsheetId ? AGT.CAMPAIGN_TRACKER : (agent.spreadsheetId ? AGT.CAMPAIGN_TRACKER : (agent.agentCode + AGT.CAMPAIGN_TRACKER));
+  const { headers: ctHeaders, rows: ctRows } = await readSheet(agentSsId, ctSheetName);
   const ctReqCol = ctHeaders.indexOf('Request ID');
   const ctStatusCol = ctHeaders.indexOf('Status');
   const campaignStatus = new Map();
@@ -481,16 +485,16 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
     // Write in batches of 10 to avoid large payloads
     for (let i = 0; i < rowUpdates.length; i += 10) {
       const batch = rowUpdates.slice(i, i + 10);
-      await Promise.all(batch.map(u => writeRow(MAIN_SS_ID, mtName, u.rowIndex, u.values)));
+      await Promise.all(batch.map(u => writeRow(agentSsId, mtName, u.rowIndex, u.values)));
       await sleep(200);
     }
   }
-  if (qlAppends.length) await appendRows(MAIN_SS_ID, qlName, qlAppends);
-  if (ncAppends.length) await appendRows(MAIN_SS_ID, ncName, ncAppends);
-  if (ncDeletes.length) await deleteRows(MAIN_SS_ID, ncName, ncDeletes);
+  if (qlAppends.length) await appendRows(agentSsId, qlName, qlAppends);
+  if (ncAppends.length) await appendRows(agentSsId, ncName, ncAppends);
+  if (ncDeletes.length) await deleteRows(agentSsId, ncName, ncDeletes);
 
   // Refresh campaign tracker
-  if (stats.updated > 0) await _refreshCampaignTracker(agent, mtHeaders, mtRows.map((r, i) => {
+  if (stats.updated > 0) await _refreshCampaignTracker(agent, agentSsId, mtHeaders, mtRows.map((r, i) => {
     const upd = rowUpdates.find(u => u.rowIndex === i + 2);
     return upd ? upd.values : r;
   }));
@@ -498,12 +502,12 @@ async function _pollAgent(agent, userRoleMap, triggerMap) {
   return stats;
 }
 
-async function _refreshCampaignTracker(agent, mtHeaders, mtRows) {
+async function _refreshCampaignTracker(agent, agentSsId, mtHeaders, mtRows) {
   try {
-    const ctName = agent.agentCode + AGT.CAMPAIGN_TRACKER;
-    const qlName = agent.agentCode + AGT.QUALIFIED_LEADS;
+    const ctName = agent.spreadsheetId ? AGT.CAMPAIGN_TRACKER : (agent.agentCode + AGT.CAMPAIGN_TRACKER);
+    const qlName = agent.spreadsheetId ? AGT.QUALIFIED_LEADS : (agent.agentCode + AGT.QUALIFIED_LEADS);
 
-    const { headers: ctHeaders, rows: ctRows } = await readSheet(MAIN_SS_ID, ctName);
+    const { headers: ctHeaders, rows: ctRows } = await readSheet(agent.spreadsheetId || MAIN_SS_ID, ctName);
     if (!ctHeaders.length || !ctRows.length) return;
 
     const reqIdCol  = mtHeaders.indexOf('Request ID');
@@ -525,7 +529,7 @@ async function _refreshCampaignTracker(agent, mtHeaders, mtRows) {
     });
 
     // Count QL per request
-    const { headers: qlH, rows: qlRows } = await readSheet(MAIN_SS_ID, qlName);
+    const { headers: qlH, rows: qlRows } = await readSheet(agent.spreadsheetId || MAIN_SS_ID, qlName);
     const qlRidCol = qlH.indexOf('Request ID');
     if (qlRidCol >= 0) {
       qlRows.forEach(r => {
@@ -556,7 +560,7 @@ async function _refreshCampaignTracker(agent, mtHeaders, mtRows) {
     });
 
     for (const u of updates) {
-      await writeRow(MAIN_SS_ID, ctName, u.rowIndex, u.values);
+      await writeRow(agent.spreadsheetId || MAIN_SS_ID, ctName, u.rowIndex, u.values);
     }
   } catch (err) {
     console.error(`[poll] refreshCampaignTracker error on ${agent.agentCode}:`, err.message);
@@ -596,10 +600,10 @@ async function backfillMissingOutputs(agentCodeFilter = null) {
 }
 
 async function _backfillAgent(agent) {
-  const mtName = agent.agentCode + AGT.MASTER_TRACKER;
-  const qlName = agent.agentCode + AGT.QUALIFIED_LEADS;
+  const mtName = agent.spreadsheetId ? AGT.MASTER_TRACKER : (agent.agentCode + AGT.MASTER_TRACKER);
+  const qlName = agent.spreadsheetId ? AGT.QUALIFIED_LEADS : (agent.agentCode + AGT.QUALIFIED_LEADS);
 
-  const { headers: mtHeaders, rows: mtRows } = await readSheet(MAIN_SS_ID, mtName);
+  const { headers: mtHeaders, rows: mtRows } = await readSheet(agent.spreadsheetId || MAIN_SS_ID, mtName);
   if (!mtHeaders.length) return { missing: 0, filled: 0 };
 
   const callIdCol    = mtHeaders.indexOf('Call ID');
@@ -609,7 +613,7 @@ async function _backfillAgent(agent) {
 
   if (callIdCol < 0 || !resultFields.length) return { missing: 0, filled: 0 };
 
-  const { headers: qlHeaders, rows: qlRows } = await readSheet(MAIN_SS_ID, qlName);
+  const { headers: qlHeaders, rows: qlRows } = await readSheet(agent.spreadsheetId || MAIN_SS_ID, qlName);
   const qlCallIdCol  = qlHeaders.indexOf('Call ID');
   const qlRowByCallId = {};
   if (qlCallIdCol >= 0) {
@@ -656,7 +660,7 @@ async function _backfillAgent(agent) {
     customVars.forEach(cv => { if (d.custom_data?.[cv] !== undefined) setH('in.' + cv, d.custom_data[cv]); });
     resultFields.forEach(f => { setH('out.' + f, result[f] !== undefined ? result[f] : ''); });
 
-    await writeRow(MAIN_SS_ID, mtName, i + 2, newRow);
+    await writeRow(agent.spreadsheetId || MAIN_SS_ID, mtName, i + 2, newRow);
     filled++;
 
     // Mirror to QL if this call is there
@@ -671,7 +675,7 @@ async function _backfillAgent(agent) {
           changed = true;
         }
       });
-      if (changed) await writeRow(MAIN_SS_ID, qlName, qlRowIdx, newQlRow);
+      if (changed) await writeRow(agent.spreadsheetId || MAIN_SS_ID, qlName, qlRowIdx, newQlRow);
     }
 
     await sleep(400);
@@ -696,8 +700,9 @@ async function repairUnassignedLeads() {
 
   for (const agent of agents) {
     try {
-      const qlName = agent.agentCode + AGT.QUALIFIED_LEADS;
-      const { headers, rows } = await readSheet(MAIN_SS_ID, qlName);
+      const agentSsId2 = agent.spreadsheetId || MAIN_SS_ID;
+      const qlName = agent.spreadsheetId ? AGT.QUALIFIED_LEADS : (agent.agentCode + AGT.QUALIFIED_LEADS);
+      const { headers, rows } = await readSheet(agent.spreadsheetId || MAIN_SS_ID, qlName);
       if (!headers.length || !rows.length) continue;
 
       const assignCol    = headers.indexOf('Assigned To Email');
@@ -722,7 +727,7 @@ async function repairUnassignedLeads() {
       });
 
       for (const u of updates) {
-        await writeRow(MAIN_SS_ID, qlName, u.rowIndex, u.values);
+        await writeRow(agent.spreadsheetId || MAIN_SS_ID, qlName, u.rowIndex, u.values);
         totalFixed++;
       }
       if (updates.length) await sleep(500);
@@ -770,7 +775,7 @@ async function dedupeAllSheets() {
     for (const suffix of [AGT.MASTER_TRACKER, AGT.QUALIFIED_LEADS, AGT.NOT_CONNECTED]) {
       try {
         const sheetName = agent.agentCode + suffix;
-        const { headers, rows } = await readSheet(MAIN_SS_ID, sheetName);
+        const { headers, rows } = await readSheet(agent.spreadsheetId || MAIN_SS_ID, sheetName);
         if (!headers.length) continue;
         const cidCol = headers.indexOf('Call ID');
         if (cidCol < 0) continue;
@@ -785,7 +790,7 @@ async function dedupeAllSheets() {
         });
 
         if (toDelete.length) {
-          await deleteRows(MAIN_SS_ID, sheetName, toDelete);
+          await deleteRows(dedupeSsId, sheetName, toDelete);
           total += toDelete.length;
           console.log(`[dedupe] ${sheetName}: removed ${toDelete.length} duplicates`);
         }
@@ -845,8 +850,8 @@ async function archiveCompletedLeads() {
     if (!teamSSId) { console.log(`[archive] No spreadsheet for team: ${team}`); continue; }
 
     try {
-      const qlName = agent.agentCode + AGT.QUALIFIED_LEADS;
-      const { headers, rows } = await readSheet(MAIN_SS_ID, qlName);
+      const qlName = agent.spreadsheetId ? AGT.QUALIFIED_LEADS : (agent.agentCode + AGT.QUALIFIED_LEADS);
+      const { headers, rows } = await readSheet(agent.spreadsheetId || MAIN_SS_ID, qlName);
       if (!headers.length || !rows.length) continue;
 
       const csCol = headers.indexOf('Call Status');
@@ -876,7 +881,7 @@ async function archiveCompletedLeads() {
       await appendRows(teamSSId, ARCHIVE.LEADS, archiveRows);
 
       // Delete from main SS
-      await deleteRows(MAIN_SS_ID, qlName, toDelete);
+      await deleteRows(agent.spreadsheetId || MAIN_SS_ID, qlName, toDelete);
       totalArchived += toArchive.length;
       console.log(`[archive] ${agent.agentCode}: archived ${toArchive.length} leads to ${team}`);
     } catch (err) {
@@ -907,8 +912,8 @@ async function archiveCompletedMT() {
       if (archCidCol >= 0) archQLRows.forEach(r => { if (r[archCidCol]) archivedIds.add(String(r[archCidCol]).trim()); });
       if (!archivedIds.size) continue;
 
-      const mtName = agent.agentCode + AGT.MASTER_TRACKER;
-      const { headers: mtHeaders, rows: mtRows } = await readSheet(MAIN_SS_ID, mtName);
+      const mtName = agent.spreadsheetId ? AGT.MASTER_TRACKER : (agent.agentCode + AGT.MASTER_TRACKER);
+      const { headers: mtHeaders, rows: mtRows } = await readSheet(agent.spreadsheetId || MAIN_SS_ID, mtName);
       if (!mtHeaders.length) continue;
       const mtCidCol = mtHeaders.indexOf('Call ID');
       if (mtCidCol < 0) continue;
@@ -936,7 +941,7 @@ async function archiveCompletedMT() {
       if (!toArchive.length) continue;
       const now = new Date().toISOString();
       await appendRows(teamSSId, ARCHIVE.MT, toArchive.map(r => [...r, now, mtName]));
-      await deleteRows(MAIN_SS_ID, mtName, toDelete);
+      await deleteRows(agent.spreadsheetId || MAIN_SS_ID, mtName, toDelete);
       totalArchived += toArchive.length;
       console.log(`[archive] ${agent.agentCode}: archived ${toArchive.length} MT rows to ${team}`);
     } catch (err) {
@@ -1148,8 +1153,8 @@ async function processRetryQueue() {
 }
 
 async function _fireRetryGroup(agent, team, originalReqId) {
-  const mtName = agent.agentCode + AGT.MASTER_TRACKER;
-  const { headers, rows } = await readSheet(MAIN_SS_ID, mtName);
+  const mtName = agent.spreadsheetId ? AGT.MASTER_TRACKER : (agent.agentCode + AGT.MASTER_TRACKER);
+  const { headers, rows } = await readSheet(agent.spreadsheetId || MAIN_SS_ID, mtName);
   if (!headers.length) return { ok: false };
 
   const ridCol     = headers.indexOf('Request ID');
@@ -1196,8 +1201,8 @@ async function _fireRetryGroup(agent, team, originalReqId) {
 
 async function _seedMasterTracker(agent, createdCalls, requestId, triggeredBy) {
   if (!createdCalls.length) return;
-  const mtName = agent.agentCode + AGT.MASTER_TRACKER;
-  const { headers, rows } = await readSheet(MAIN_SS_ID, mtName);
+  const mtName = agent.spreadsheetId ? AGT.MASTER_TRACKER : (agent.agentCode + AGT.MASTER_TRACKER);
+  const { headers, rows } = await readSheet(agent.spreadsheetId || MAIN_SS_ID, mtName);
   if (!headers.length) return;
 
   const cidCol = headers.indexOf('Call ID');
@@ -1221,7 +1226,7 @@ async function _seedMasterTracker(agent, createdCalls, requestId, triggeredBy) {
     newRows.push(row);
   });
 
-  if (newRows.length) await appendRows(MAIN_SS_ID, mtName, newRows);
+  if (newRows.length) await appendRows(agentSsId, mtName, newRows);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -15,7 +15,11 @@ function getAuth() {
   const sa = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
   _auth = new google.auth.GoogleAuth({
     credentials: sa,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    // Drive scope required for createSpreadsheet + shareSpreadsheet
+    scopes: [
+      'https://www.googleapis.com/auth/spreadsheets',
+      'https://www.googleapis.com/auth/drive',
+    ],
   });
   return _auth;
 }
@@ -295,6 +299,38 @@ async function testConnection(spreadsheetId) {
   return true;
 }
 
+/**
+ * Create a new Google Spreadsheet and return its ID.
+ * Uses the service account (no Drive API needed — Sheets API create endpoint works with spreadsheets scope).
+ */
+async function createSpreadsheet(title) {
+  const client = getSheetsClient();
+  const res = await withRetry(() => client.spreadsheets.create({
+    requestBody: { properties: { title } },
+  }));
+  return res.data.spreadsheetId;
+}
+
+/**
+ * Share a spreadsheet with one or more email addresses (writer access).
+ * Requires Drive scope on the service account.
+ */
+async function shareSpreadsheet(fileId, ...emails) {
+  const auth  = getAuth();
+  const drive = google.drive({ version: 'v3', auth });
+  for (const email of emails.filter(Boolean)) {
+    try {
+      await withRetry(() => drive.permissions.create({
+        fileId,
+        requestBody: { role: 'writer', type: 'user', emailAddress: email },
+        sendNotificationEmail: false,
+      }));
+    } catch (e) {
+      console.warn(`[sheets] shareSpreadsheet: could not share ${fileId} with ${email}:`, e.message);
+    }
+  }
+}
+
 module.exports = {
   readRange,
   readSheet,
@@ -308,6 +344,9 @@ module.exports = {
   deleteRows,
   formatHeaderRow,
   testConnection,
+  createSpreadsheet,
+  shareSpreadsheet,
+  getAuth,
   sleep,
   withRetry,
 };
